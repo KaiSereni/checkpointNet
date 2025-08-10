@@ -1,140 +1,133 @@
-import json
 import torch
 import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
-import numpy as np
+import torch.nn.functional as F
+import math
 
-# Custom Dataset Class
-class CustomDataset(Dataset):
-    def __init__(self, data_path):
-        with open(data_path, 'r') as f:
-            data = json.load(f)
-        self.inputs = []
-        self.outputs = []
-        for key_str, output in data.items():
-            # Convert key string to list of floats (adjust based on your key format)
-            input_arr = list(map(float, key_str.split(',')))
-            self.inputs.append(input_arr)
-            self.outputs.append(output)
-        self.inputs = torch.tensor(np.array(self.inputs), dtype=torch.float32)
-        self.outputs = torch.tensor(np.array(self.outputs), dtype=torch.float32)
-    
-    def __len__(self):
-        return len(self.inputs)
-    
-    def __getitem__(self, idx):
-        return self.inputs[idx], self.outputs[idx]
-
-# Custom Checkpoint Layer
-class CheckpointLayer(nn.Module):
-    def __init__(self, input_dim, output_dim):
+class CheckpointModule(nn.Module):
+    def __init__(self, dim):
         super().__init__()
-        self.main_layer = nn.Linear(input_dim, output_dim)
-        self.confidence_layer = nn.Linear(output_dim, 1)
-        
-    def forward(self, x):
-        output = self.main_layer(x)
-        confidence = torch.sigmoid(self.confidence_layer(output))
-        return output, confidence
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.ReLU(),
+            nn.Linear(dim, dim)
+        )
 
-# Main Model
-class CustomModel(nn.Module):
-    def __init__(self, config_path):
+    def forward(self, y):
+        return y + self.mlp(y)
+
+class PartnerNet(nn.Module):
+    def __init__(self, dim):
         super().__init__()
-        with open(config_path, 'r') as f:
-            self.config = json.load(f)
-        
-        self.layers = nn.ModuleList()
-        current_dim = self.config['input_dim']
-        
-        for layer_config in self.config['hidden_layers']:
-            layer_type = layer_config['type']
-            if layer_type == 'fully_connected':
-                layer = nn.Linear(current_dim, layer_config['size'])
-                self.layers.append(layer)
-                self.layers.append(nn.ReLU())
-                current_dim = layer_config['size']
-            elif layer_type == 'checkpoint':
-                layer = CheckpointLayer(current_dim, layer_config['size'])
-                self.layers.append(layer)
-                current_dim = layer_config['size']
-            elif layer_type == 'convolutional':
-                # Example for Conv1D (adjust parameters as needed)
-                in_channels = current_dim
-                out_channels = layer_config['size']
-                kernel_size = layer_config.get('kernel_size', 3)
-                layer = nn.Conv1d(in_channels, out_channels, kernel_size, padding='same')
-                self.layers.append(layer)
-                self.layers.append(nn.ReLU())
-                current_dim = out_channels  # Adjust based on actual output dimensions
-        
-        self.final_layer = nn.Linear(current_dim, self.config['output_dim'])
-        self.learning_rate = self.config.get('learning_rate', 0.001)
-    
-    def forward(self, x, training=True, threshold=0.1):
-        checkpoint_outputs = []
-        confidences = []
-        x = x.view(x.size(0), -1)  # Flatten input for fully connected layers
-        
-        for layer in self.layers:
-            if isinstance(layer, CheckpointLayer):
-                x, confidence = layer(x)
-                checkpoint_outputs.append(x)
-                confidences.append(confidence)
-                
-                if not training:
-                    batch_avg_confidence = torch.mean(confidence)
-                    if batch_avg_confidence < threshold:
-                        return x
-            else:
-                x = layer(x)
-        
-        final_output = self.final_layer(x)
-        
-        if training:
-            return final_output, checkpoint_outputs, confidences
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, dim // 2),
+            nn.ReLU(),
+            nn.Linear(dim // 2, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, y):
+        return self.mlp(y)
+
+class PostNet(nn.Module):
+    def __init__(self, dim, num_classes):
+        super().__init__()
+        self.mlp = nn.Linear(dim, num_classes)
+
+    def forward(self, y):
+        return self.mlp(y)
+
+class CheckpointController(nn.Module):
+    def __init__(self, input_dim, hidden_dim, num_classes, max_steps):
+        super().__init__()
+        self.proj = nn.Linear(input_dim, hidden_dim)
+        self.checkpoint = CheckpointModule(hidden_dim)
+        self.partner = PartnerNet(hidden_dim)
+        self.post = PostNet(hidden_dim, num_classes)
+        self.max_steps = max_steps
+        self.num_classes = num_classes
+
+    def forward(self, x, labels=None, train=True, conf_threshold=0.95, alpha=1.0, lambda_cost=0.01):
+        y = self.proj(x)  # y0
+        batch_size = x.size(0)
+        device = x.device
+
+        if not train:
+            # Inference: hard halting per sample
+            y_ts = []
+            p_ts = []
+            y_cur = y
+            for _ in range(self.max_steps):
+                y_cur = self.checkpoint(y_cur)
+                y_ts.append(y_cur.unsqueeze(1))  # batch x 1 x dim
+                p = self.partner(y_cur)
+                p_ts.append(p.unsqueeze(1))  # batch x 1 x 1
+
+            y_ts = torch.cat(y_ts, dim=1)  # batch x max_steps x dim
+            p_ts = torch.cat(p_ts, dim=1)  # batch x max_steps x 1
+
+            # Find the first step where p_t > conf_threshold for each sample
+            exceeds = p_ts.squeeze(-1) > conf_threshold  # batch x max_steps
+            halting_steps = torch.argmax(exceeds.float(), dim=1)  # index of first True
+            # If no halt, use last step
+            no_halt = ~exceeds.any(dim=1)
+            halting_steps[no_halt] = self.max_steps - 1
+
+            # Gather the y at halting step
+            final_y = y_ts[torch.arange(batch_size, device=device), halting_steps]
+            logits = self.post(final_y)
+            return logits
+
         else:
-            return final_output
+            # Training: soft halting
+            assert labels is not None, "Labels required for training"
+            y_ts = []
+            p_ts = []
+            loss_ts = []
+            y_cur = y
+            for _ in range(self.max_steps):
+                y_cur = self.checkpoint(y_cur)
+                y_ts.append(y_cur.unsqueeze(1))
+                logits_cur = self.post(y_cur)
+                loss_cur = F.cross_entropy(logits_cur, labels, reduction='none')  # batch
+                loss_ts.append(loss_cur.unsqueeze(1))
+                p = self.partner(y_cur)
+                p_ts.append(p.unsqueeze(1))
 
-# Training Function
-def train_model(model, dataloader, num_epochs):
-    criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=model.learning_rate)
-    
-    model.train()
-    for epoch in range(num_epochs):
-        total_loss = 0.0
-        for inputs, targets in dataloader:
-            optimizer.zero_grad()
-            final_output, checkpoint_outputs, confidences = model(inputs, training=True)
-            
-            main_loss = criterion(final_output, targets)
-            confidence_loss = 0.0
-            
-            for co, conf in zip(checkpoint_outputs, confidences):
-                delta = torch.mean((co - final_output) ** 2, dim=1)
-                scaled_delta = delta / (delta + 1)  # Scale delta to [0, 1)
-                conf_loss = torch.mean((conf.squeeze() - scaled_delta) ** 2)
-                confidence_loss += conf_loss
-            
-            total_batch_loss = main_loss + confidence_loss
-            total_batch_loss.backward()
-            optimizer.step()
-            
-            total_loss += total_batch_loss.item()
-        
-        print(f'Epoch {epoch+1}, Loss: {total_loss / len(dataloader)}')
+            y_ts = torch.cat(y_ts, dim=1)  # batch x steps x dim
+            p_ts = torch.cat(p_ts, dim=1)  # batch x steps x 1
+            loss_ts = torch.cat(loss_ts, dim=1)  # batch x steps
 
-# Example Usage
-if __name__ == "__main__":
-    # Initialize dataset and model
-    dataset = CustomDataset('dataset.json')
-    dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
-    model = CustomModel('config.json')
-    
-    # Train the model
-    train_model(model, dataloader, num_epochs=10)
-    
-    # Save the trained model
-    torch.save(model.state_dict(), 'trained_model.pth')
+            # Compute soft halting weights g_t
+            one_minus_p = 1 - p_ts.squeeze(-1)  # batch x steps
+            # Prefix products: prod_{i < t} (1 - p_i)
+            prefix_init = torch.cat([torch.ones(batch_size, 1, device=device), one_minus_p[:, :-1]], dim=1)
+            prefix_prod = torch.cumprod(prefix_init, dim=1)  # batch x steps
+
+            g = p_ts.squeeze(-1) * prefix_prod  # batch x steps
+
+            # Add remainder to last g
+            remainder = prefix_prod[:, -1] * one_minus_p[:, -1]
+            g[:, -1] += remainder
+
+            # Final y as weighted sum
+            final_y = torch.sum(g.unsqueeze(-1) * y_ts, dim=1)  # batch x dim
+            final_logits = self.post(final_y)
+            L_task = F.cross_entropy(final_logits, labels)
+
+            # Partner loss with randomized tau
+            max_loss = math.log(self.num_classes)
+            tau = torch.rand_like(loss_ts) * max_loss
+            h_t = (loss_ts < tau).float()
+            L_partner = F.binary_cross_entropy(p_ts.squeeze(-1), h_t)
+
+            # Expected steps
+            steps = torch.arange(1, self.max_steps + 1, device=device).float()  # 1 to max_steps
+            expected_steps = torch.mean(torch.sum(g * steps, dim=1))
+
+            total_loss = L_task + alpha * L_partner + lambda_cost * expected_steps
+            return total_loss
+
+# Example usage:
+# model = CheckpointController(input_dim=784, hidden_dim=128, num_classes=10, max_steps=5)
+# For training: loss = model(inputs, labels=targets, train=True)
+# For inference: preds = model(inputs, train=False)
